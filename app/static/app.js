@@ -62,6 +62,18 @@ function renderWindow(snap) {
   const collectPct = Math.min(elapsed / total, w.collect_ms / total) * 100;
   const gracePct = Math.max(0, (elapsed - w.collect_ms) / total) * 100;
 
+  const inc = snap.incremental;
+  const incText = !inc ? "" :
+    inc.source === "full_build"
+      ? "本次预览：以 SQLite 当前数据全量重算"
+      : inc.source === "reuse"
+        ? "本次预览：span 与配额未变，复用上次计算结果"
+        : `本次预览：增量重算 ${inc.component_evals} 组 / ${inc.traces_evaluated} 条链路` +
+          `${inc.merges ? `（合并 ${inc.merges} 次分组）` : ""}，复用 ${inc.traces_reused} 条链路`;
+  const groupsHtml = (snap.groups || []).map((g) =>
+    `<span class="tier-tag" title="链路：${g.traces.join(", ")}">组#${g.id} · ${g.services.join("+") || "无服务"} · ${g.traces.length} 链路</span>`
+  ).join(" ");
+
   panel.innerHTML = `
     <div class="phase-row">
       <span class="badge ${phase}">#${w.id} · ${PHASE_LABEL[phase] || phase}</span>
@@ -81,7 +93,8 @@ function renderWindow(snap) {
     <div class="progress" title="蓝=收集，橙=宽限">
       <span style="width:${collectPct}%; display:inline-block; height:100%; background:var(--accent); float:left;"></span
       ><span class="grace-part" style="width:${gracePct}%; display:inline-block; height:100%; float:left;"></span>
-    </div>`;
+    </div>
+    ${inc ? `<div class="inc-row"><span>${incText}（共享服务分组 ${inc.components} 个）</span>${groupsHtml}</div>` : ""}`;
 
   // quotas
   $("quota-panel").innerHTML = snap.quotas.length

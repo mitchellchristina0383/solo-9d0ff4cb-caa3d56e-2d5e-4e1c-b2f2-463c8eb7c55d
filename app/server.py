@@ -10,6 +10,7 @@ GET  /api/health               liveness probe
 GET  /api/window/current       full snapshot of the active/last window
 GET  /api/windows              window history
 GET  /api/windows/<id>         one closed/active window with full details
+GET  /api/debug/cache          incremental-cache layout and statistics
 POST /api/windows              create a window (collect/grace/slow/quota)
 POST /api/windows/<id>/quotas  upsert per-service retention quota
 POST /api/windows/<id>/finalize close the window immediately (run decision)
@@ -24,10 +25,12 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from . import sampler
+from .incremental import WindowCache
 from .storage import Storage
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,7 +48,16 @@ class ApiError(Exception):
 
 
 class AppState:
-    """Holds the database and the pluggable clock (real time by default)."""
+    """Holds the database, the pluggable clock and the per-window caches.
+
+    ``_caches`` maps window id -> ``WindowCache`` (incremental evaluation
+    state). Caches are pure derivatives of the committed SQLite data: they
+    are dropped on reset / restart / window switch and rebuilt from the
+    database on first touch, so a preview after any of those events is a
+    full recompute over the current SQLite contents.
+    """
+
+    CACHE_CAP = 16  # bound on simultaneously cached windows (LRU)
 
     def __init__(self, db_path: str):
         self.storage = Storage(db_path)
@@ -53,8 +65,33 @@ class AppState:
         # now_ms is indirected so tests can drive deterministic scenarios;
         # production simply reads the wall clock.
         self.now_ms = lambda: int(time.time() * 1000)
+        self._caches: "OrderedDict[int, WindowCache]" = OrderedDict()
         self.startup_count = int(self.storage.get_meta("startup_count") or 0) + 1
         self.storage.set_meta("startup_count", str(self.startup_count))
+
+    # --------------------------------------------------------------- caches
+    def _get_cache(self, w) -> WindowCache:
+        """Return the live cache for a window row, building it if needed.
+
+        A build is a full recompute over the window's committed SQLite data
+        (first touch, or after the cache was dropped by reset / restart /
+        window switch / LRU eviction).
+        """
+        wid = w["id"]
+        cache = self._caches.get(wid)
+        if cache is None:
+            cache = WindowCache.from_storage(self.storage, w)
+            self._caches[wid] = cache
+            self._caches.move_to_end(wid)
+            while len(self._caches) > self.CACHE_CAP:
+                self._caches.popitem(last=False)
+            return cache
+        self._caches.move_to_end(wid)
+        if w["status"] == "closed" and cache.mode != "closed":
+            # Defensive: the window was finalized while this cache was alive
+            # but not through _finalize_locked (cannot happen today).
+            cache.set_closed(self.storage.get_exported_trace_ids(wid))
+        return cache
 
     # ------------------------------------------------------------- windows
     def phase_of(self, w) -> str:
@@ -122,7 +159,11 @@ class AppState:
             if w["status"] != "open":
                 raise ApiError(409, "窗口已关闭，不能再修改配额")
             self.storage.upsert_quota(window_id, service, quota)
-            return self._snapshot_locked(self.storage.get_window(window_id))
+            w = self.storage.get_window(window_id)
+            cache = self._get_cache(w)
+            # Only the component sharing this service is re-evaluated.
+            cache.set_quota(service, quota)
+            return self._snapshot_locked(w)
 
     def finalize(self, window_id: int) -> dict:
         with self.storage.lock:
@@ -137,23 +178,25 @@ class AppState:
     def _finalize_locked(self, window_id: int) -> None:
         """Run the tail decision once and persist exported trace ids.
 
+        The keep set comes from the window's incremental cache, which is
+        guaranteed to match a full recompute over the same committed data.
         The export table has a primary key on (window_id, trace_id), so even
         a duplicate finalize pass can never export a trace twice.
         """
         w = self.storage.get_window(window_id)
-        span_rows = self.storage.get_spans(window_id)
-        traces = sampler.build_traces(span_rows)
-        quotas = self.storage.get_quotas(window_id)
+        cache = self._get_cache(w)
+        cache.ensure_clean()  # open-mode decisions are the finalize decisions
         already = self.storage.get_exported_trace_ids(window_id)
-        result = sampler.evaluate_window(
-            traces, quotas, w["default_quota"], w["slow_ms"], already
-        )
         now = self.now_ms()
-        for trace_id, d in result["decisions"].items():
+        for trace_id, d in cache.decisions.items():
             if d["decision"] == sampler.KEEP and trace_id not in already:
-                count = len(traces[trace_id].spans)
+                count = len(cache.traces[trace_id].spans)
                 self.storage.save_export(window_id, trace_id, now, count)
         self.storage.close_window(window_id, now)
+        # Closed windows present exported traces with the idempotent-keep
+        # reason; re-evaluate once in closed mode so the preview matches a
+        # full recompute of the closed window exactly.
+        cache.set_closed(self.storage.get_exported_trace_ids(window_id))
 
     # ---------------------------------------------------------------- spans
     def submit_span(self, payload: dict) -> dict:
@@ -198,7 +241,18 @@ class AppState:
                     "span 时间戳已超过收集窗口+宽限期，该窗口已不可接收新 span",
                 )
             late = span["start_ms"] >= collect_end or now >= collect_end
-            inserted = self.storage.insert_span(span, w["id"], now, late)
+            # Fetch (or build) the cache *before* writing, so a cache miss
+            # cannot rebuild from a database that already contains this span.
+            cache = self._get_cache(w)
+            inserted, row_id = self.storage.insert_span(span, w["id"], now, late)
+            if inserted:
+                # Fold the span into the cache incrementally: only the
+                # affected component (possibly two merged ones) is
+                # re-evaluated; every other chain keeps its prior result.
+                cache.add_span({
+                    **span, "id": row_id, "received_ms": now,
+                    "late": late, "window_id": w["id"],
+                })
             snap = self._snapshot_locked(self.storage.get_window(w["id"]))
             snap["span_accepted"] = inserted
             if not inserted:
@@ -207,68 +261,19 @@ class AppState:
 
     # ------------------------------------------------------------ snapshots
     def _snapshot_locked(self, w) -> dict:
-        """Build the full JSON representation of one window."""
-        span_rows = self.storage.get_spans(w["id"])
-        traces = sampler.build_traces(span_rows)
-        quotas = self.storage.get_quotas(w["id"])
-        exported = self.storage.get_exported_trace_ids(w["id"])
-        phase = self.phase_of(w)
+        """Build the full JSON representation of one window.
 
-        if w["status"] == "closed":
-            result = sampler.evaluate_window(
-                traces, quotas, w["default_quota"], w["slow_ms"], exported
-            )
-        else:
-            result = sampler.tentative_evaluation(
-                traces, quotas, w["default_quota"], w["slow_ms"]
-            )
-
-        trace_list = []
-        for trace_id in sorted(traces, key=lambda tid: (
-                traces[tid].tier(w["slow_ms"]), traces[tid].start_ms, tid)):
-            t = traces[trace_id]
-            trace_list.append(
-                sampler.trace_payload(t, w["slow_ms"], result["decisions"][trace_id])
-            )
-
-        collect_end = w["start_ms"] + w["collect_ms"]
-        grace_end = collect_end + w["grace_ms"]
-        services_seen = sorted({s["service"] for s in span_rows})
-        quota_view = []
-        for svc in sorted(set(services_seen) | set(quotas)):
-            q = quotas.get(svc, w["default_quota"])
-            quota_view.append({
-                "service": svc,
-                "quota": q,
-                "explicit": svc in quotas,
-                "used": result["occupancy"].get(svc, {"used": 0})["used"],
-            })
-
-        return {
-            "window": {
-                "id": w["id"],
-                "start_ms": w["start_ms"],
-                "collect_ms": w["collect_ms"],
-                "grace_ms": w["grace_ms"],
-                "slow_ms": w["slow_ms"],
-                "default_quota": w["default_quota"],
-                "status": w["status"],
-                "phase": phase,
-                "collect_end_ms": collect_end,
-                "grace_end_ms": grace_end,
-                "finalized_at_ms": w["finalized_at_ms"],
-                "server_now_ms": self.now_ms(),
-            },
-            "quotas": quota_view,
-            "traces": trace_list,
-            "exports": [dict(r) for r in self.storage.get_exports(w["id"])],
-            "span_count": len(span_rows),
-            "kept_trace_count": sum(1 for t in trace_list
-                                    if t["decision"] == sampler.KEEP),
-            "dropped_trace_count": sum(
-                1 for t in trace_list if t["decision"] == sampler.DROP_QUOTA
-            ),
-        }
+        Served from the window's incremental cache: an unchanged window
+        reuses the previous computation; a changed window only re-evaluates
+        the components affected through shared services. A cache miss (first
+        touch, reset, window switch, restart) triggers a full recompute over
+        the current SQLite data.
+        """
+        cache = self._get_cache(w)
+        return cache.snapshot(
+            w, self.phase_of(w), self.now_ms(),
+            self.storage.get_exports(w["id"]),
+        )
 
     def current_snapshot(self) -> dict:
         with self.storage.lock:
@@ -308,6 +313,7 @@ class AppState:
     def reset(self) -> dict:
         with self.storage.lock:
             self.storage.reset()
+            self._caches.clear()  # next preview is rebuilt from empty SQLite
             self.startup_count = 1
             self.storage.set_meta("startup_count", "1")
         return {"ok": True, "message": "所有数据已清空"}
@@ -317,12 +323,24 @@ class AppState:
         with self.storage.lock:
             self.storage.close()
             self.storage = Storage(self.db_path)
+            # Drop all in-memory caches: the next preview is a full recompute
+            # over the current SQLite data, exactly like a real restart.
+            self._caches.clear()
             self.startup_count = int(
                 self.storage.get_meta("startup_count") or 0
             ) + 1
             self.storage.set_meta("startup_count", str(self.startup_count))
             return {"ok": True, "startup_count": self.startup_count,
                     "message": "已从 SQLite 重新加载全部状态（模拟进程重启）"}
+
+    def cache_debug(self) -> dict:
+        """Inspect the incremental caches (component layout + statistics)."""
+        with self.storage.lock:
+            return {
+                "cache_cap": self.CACHE_CAP,
+                "cached_windows": len(self._caches),
+                "windows": [c.debug_info() for c in self._caches.values()],
+            }
 
 
 # --------------------------------------------------------------------- HTTP
@@ -398,6 +416,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, self.state.current_snapshot())
             elif path == "/api/windows":
                 self._send_json(200, self.state.history())
+            elif path == "/api/debug/cache":
+                self._send_json(200, self.state.cache_debug())
             elif path.startswith("/api/windows/"):
                 wid = int(path.split("/")[3])
                 self._send_json(200, self.state.window_detail(wid))

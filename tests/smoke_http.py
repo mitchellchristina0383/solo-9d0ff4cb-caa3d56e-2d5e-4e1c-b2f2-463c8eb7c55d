@@ -79,6 +79,25 @@ call("POST", "/api/spans", dict(span_id="c1", trace_id="T-comp",
      service="payment", operation="op", start_ms=base + 50,
      duration_ms=30, status="ok"))
 
+print("== incremental preview metadata ==")
+st, snap = call("GET", "/api/window/current")
+check("snapshot carries incremental info",
+      "incremental" in snap and "groups" in snap)
+inc = snap["incremental"]
+check("incremental source valid",
+      inc["source"] in ("full_build", "incremental", "reuse"), inc["source"])
+check("all traces linked via gateway/payment form one group",
+      inc["components"] == 1, str(snap["groups"]))
+st, snap2 = call("GET", "/api/window/current")
+check("unchanged poll reuses previous computation",
+      snap2["incremental"]["source"] == "reuse"
+      and snap2["incremental"]["component_evals"] == 0,
+      str(snap2["incremental"]))
+st, dbg = call("GET", "/api/debug/cache")
+check("debug cache endpoint 200", st == 200)
+check("debug cache tracks the window",
+      any(w["window_id"] == wid for w in dbg["windows"]), str(dbg))
+
 print("== enter grace period, late error arrives ==")
 time.sleep(2.2)
 st, snap = call("GET", "/api/window/current")

@@ -170,15 +170,19 @@ class Storage:
 
     # ----------------------------------------------------------------- spans
     def insert_span(self, span: dict[str, Any], window_id: int, now_ms: int,
-                    late: bool) -> bool:
-        """Insert a span. Returns False if span_id already exists (idempotent)."""
+                    late: bool) -> tuple[bool, Optional[int]]:
+        """Insert a span.
+
+        Returns ``(True, row_id)`` on success, ``(False, None)`` when the
+        span_id already exists (idempotent duplicate, nothing written).
+        """
         with self._lock:
             exists = self._conn.execute(
                 "SELECT 1 FROM spans WHERE span_id=?", (span["span_id"],)
             ).fetchone()
             if exists:
-                return False
-            self._conn.execute(
+                return False, None
+            cur = self._conn.execute(
                 "INSERT INTO spans(span_id, trace_id, service, operation, "
                 "start_ms, duration_ms, status, received_ms, late, window_id) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -189,7 +193,7 @@ class Storage:
                 ),
             )
             self._conn.commit()
-            return True
+            return True, int(cur.lastrowid)
 
     def get_spans(self, window_id: int) -> list[sqlite3.Row]:
         with self._lock:
